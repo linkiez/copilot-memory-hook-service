@@ -1,0 +1,5 @@
+node_modules/
+coverage/
+.env
+session-state/
+.DS_Store

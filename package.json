@@ -1,0 +1,31 @@
+{
+  "name": "copilot-memory-hook-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone memory hook service and HTTP CLI for GitHub Copilot hook workflows.",
+  "type": "commonjs",
+  "bin": {
+    "memory-cycle-hook": "scripts/memory-cycle.js",
+    "mcp-memory-http-cli": "scripts/mcp-memory-http-cli.js"
+  },
+  "scripts": {
+    "test": "node --test tests/mcp-memory-http-cli.test.js tests/memory-cycle.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "scripts",
+    "tests",
+    "examples",
+    "README.md"
+  ],
+  "keywords": [
+    "copilot",
+    "hooks",
+    "memory",
+    "mcp",
+    "cli"
+  ],
+  "license": "MIT"
+}

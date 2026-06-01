@@ -1,0 +1,60 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "/absolute/path/to/copilot-memory-hook-service/scripts/memory-cycle.js",
+        "timeout": 5
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "/absolute/path/to/copilot-memory-hook-service/scripts/memory-cycle.js",
+        "timeout": 5
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "/absolute/path/to/copilot-memory-hook-service/scripts/memory-cycle.js",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "/absolute/path/to/copilot-memory-hook-service/scripts/memory-cycle.js",
+        "timeout": 5
+      }
+    ],
+    "PreCompact": [
+      {
+        "type": "command",
+        "command": "/absolute/path/to/copilot-memory-hook-service/scripts/memory-cycle.js",
+        "timeout": 5
+      }
+    ],
+    "SubagentStart": [
+      {
+        "type": "command",
+        "command": "/absolute/path/to/copilot-memory-hook-service/scripts/memory-cycle.js",
+        "timeout": 5
+      }
+    ],
+    "SubagentStop": [
+      {
+        "type": "command",
+        "command": "/absolute/path/to/copilot-memory-hook-service/scripts/memory-cycle.js",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "/absolute/path/to/copilot-memory-hook-service/scripts/memory-cycle.js",
+        "timeout": 5
+      }
+    ]
+  }
+}

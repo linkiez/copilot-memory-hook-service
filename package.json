@@ -11,7 +11,7 @@
   "scripts": {
     "build": "node tools/build-hooks.cjs",
     "pretest": "npm run build",
-    "test": "node --test tests/mcp-memory-http-cli.test.js tests/memory-cycle.test.js"
+    "test": "node --test tests/build-hooks.test.js tests/mcp-memory-http-cli.test.js tests/memory-cycle.test.js"
   },
   "engines": {
     "node": ">=20"

@@ -1,6 +1,37 @@
-const { DEFAULT_COPILOT_INSTRUCTION, DEFAULT_COPILOT_MODEL, DEFAULT_SEARCH_COPILOT_INSTRUCTION, preprocessMemoryText, preprocessSearchQuery } = require('./mcp-memory-copilot-processor');
+import {
+  buildListQuery,
+  buildSemanticSearchBody,
+  buildSessionBody,
+  buildStoreBody,
+  buildTagSearchBody,
+  buildTimeSearchBody,
+  buildUpdateBody,
+  buildUploadParts,
+  firstOf,
+  mapSearchResults,
+  maybePreprocessArgs,
+  normalizeHealthResponse,
+  omitUndefined,
+  parseJsonRpcId,
+  parseTags,
+  parseOptionalBoolean,
+  parseOptionalFloat,
+  parseOptionalInt,
+  parseOptionalJson,
+  requireBoolean,
+  requireInt,
+  requireString,
+  requireTags
+} from './mcp-memory-http-command-utils.js';
 
-const COMMANDS = {
+import type { MemoryHttpClient } from './mcp-memory-http-client.js';
+import type { MemorySearchResponse, RawCliArguments } from './types.js';
+
+type CommandHandler = (client: MemoryHttpClient, args: RawCliArguments) => Promise<unknown>;
+
+type CommandScope = 'api' | 'root';
+
+const COMMANDS: Record<string, CommandHandler> = {
   health: async (client) => normalizeHealthResponse(await client.requestJson({ method: 'GET', scope: 'api', path: 'health' })),
   'health-detailed': jsonCommand('GET', 'api', 'health/detailed'),
   'health-sync-status': jsonCommand('GET', 'api', 'health/sync-status'),
@@ -83,7 +114,7 @@ const COMMANDS = {
   dashboard: textCommand('GET', 'root', '')
 };
 
-const DIRECT_TOOL_COMMANDS = {
+const DIRECT_TOOL_COMMANDS: Record<string, string> = {
   check_database_health: 'health',
   store_memory: 'store',
   retrieve_memory: 'search',
@@ -91,8 +122,8 @@ const DIRECT_TOOL_COMMANDS = {
   delete_memory: 'delete'
 };
 
-async function runCommand(client, commandName, rawArgs) {
-  const preparedArgs = await maybePreprocessArgs(commandName, rawArgs || {});
+export async function runCommand(client: MemoryHttpClient, commandName: string, rawArgs: RawCliArguments): Promise<unknown> {
+  const preparedArgs = await maybePreprocessArgs(commandName, rawArgs ?? {});
   const command = COMMANDS[commandName];
   if (!command) {
     throw new Error(`Unknown command: ${commandName}`);
@@ -101,17 +132,17 @@ async function runCommand(client, commandName, rawArgs) {
   return command(client, preparedArgs);
 }
 
-function listCommands() {
+export function listCommands() {
   return Object.keys(COMMANDS).sort((left, right) => left.localeCompare(right));
 }
 
-async function runDirectTool(client, args) {
+async function runDirectTool(client: MemoryHttpClient, args: RawCliArguments): Promise<unknown> {
   const toolName = requireString(args.tool, '--tool');
   if (!DIRECT_TOOL_COMMANDS[toolName]) {
     throw new Error(`Unsupported tool: ${toolName}`);
   }
 
-  const toolArguments = parseOptionalJson(args.arguments, '--arguments') || {};
+  const toolArguments = asArgumentRecord(parseOptionalJson(args.arguments, '--arguments'));
   if (toolName === 'check_database_health') {
     return normalizeHealthResponse(await client.requestJson({ method: 'GET', scope: 'api', path: 'health' }));
   }
@@ -121,21 +152,29 @@ async function runDirectTool(client, args) {
   }
 
   if (toolName === 'retrieve_memory') {
-    const response = await client.requestJson({ method: 'POST', scope: 'api', path: 'search', jsonBody: buildSemanticSearchBody(normalizeToolArguments(toolName, toolArguments)) });
+    const response = await client.requestJson<MemorySearchResponse>({ method: 'POST', scope: 'api', path: 'search', jsonBody: buildSemanticSearchBody(normalizeToolArguments(toolName, toolArguments)) });
     return { memories: mapSearchResults(response.results) };
   }
 
   if (toolName === 'search_by_tag') {
-    const response = await client.requestJson({ method: 'POST', scope: 'api', path: 'search/by-tag', jsonBody: buildTagSearchBody(normalizeToolArguments(toolName, toolArguments)) });
+    const response = await client.requestJson<MemorySearchResponse>({ method: 'POST', scope: 'api', path: 'search/by-tag', jsonBody: buildTagSearchBody(normalizeToolArguments(toolName, toolArguments)) });
     return { memories: mapSearchResults(response.results) };
   }
 
   return client.requestJson({ method: 'DELETE', scope: 'api', path: `memories/${encodeURIComponent(requireString(normalizeToolArguments(toolName, toolArguments).hash, '--hash'))}` });
 }
 
-function normalizeToolArguments(toolName, args) {
+function normalizeToolArguments(toolName: string, args: RawCliArguments): RawCliArguments {
+  const metadata = asArgumentRecord(args.metadata);
   if (toolName === 'store_memory') {
-    return { content: args.content, tags: args.metadata?.tags || args.tags, type: args.metadata?.type || args.memory_type, metadata: JSON.stringify(args.metadata || {}), copilotPreprocess: args.copilot_preprocess, copilotInstruction: args.copilot_instruction };
+    return {
+      content: args.content,
+      copilotInstruction: args.copilot_instruction,
+      copilotPreprocess: args.copilot_preprocess,
+      metadata: JSON.stringify(metadata),
+      tags: firstOf(metadata.tags, args.tags),
+      type: firstOf(metadata.type, args.memory_type)
+    };
   }
 
   if (toolName === 'retrieve_memory') {
@@ -153,352 +192,16 @@ function normalizeToolArguments(toolName, args) {
   return args;
 }
 
-function jsonCommand(method, scope, path) {
-  return (client) => client.requestJson({ method, scope, path });
+function jsonCommand(method: string, scope: CommandScope, path: string): CommandHandler {
+  return async (client) => client.requestJson({ method, scope, path });
 }
 
-async function maybePreprocessArgs(commandName, rawArgs) {
-  if (!parseOptionalBoolean(rawArgs.copilotPreprocess)) {
-    return rawArgs;
-  }
-
-  if (commandName === 'store') {
-    return preprocessStoreArgs(rawArgs);
-  }
-
-  if (commandName === 'session-store') {
-    return preprocessSessionArgs(rawArgs);
-  }
-
-  if (commandName === 'search' || commandName === 'retrieve') {
-    return preprocessSemanticSearchArgs(commandName, rawArgs);
-  }
-
-  if (commandName === 'search-by-time') {
-    return preprocessTimeSearchArgs(rawArgs);
-  }
-
-  return rawArgs;
+function textCommand(method: string, scope: CommandScope, path: string): CommandHandler {
+  return async (client) => client.requestText({ method, scope, path });
 }
 
-async function preprocessStoreArgs(rawArgs) {
-  const metadata = parseOptionalJson(rawArgs.metadata, '--metadata') || {};
-  const processed = await preprocessMemoryText({
-    content: requireString(rawArgs.content, '--content'),
-    instruction: rawArgs.copilotInstruction || DEFAULT_COPILOT_INSTRUCTION,
-    commandName: 'store',
-    model: rawArgs.copilotModel
-  });
-
-  return {
-    ...rawArgs,
-    content: processed.content,
-    metadata: JSON.stringify(mergeCopilotMetadata(metadata, processed, null))
-  };
+function asArgumentRecord(value: unknown): RawCliArguments {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as RawCliArguments
+    : {};
 }
-
-async function preprocessSessionArgs(rawArgs) {
-  const turns = parseRequiredJson(rawArgs.turns, '--turns');
-  const metadata = parseOptionalJson(rawArgs.metadata, '--metadata') || {};
-  const normalizedTurns = Array.isArray(turns) ? turns : [];
-  const processedTurns = [];
-
-  for (const turn of normalizedTurns) {
-    if (!isTurnWithContent(turn)) {
-      processedTurns.push(turn);
-      continue;
-    }
-
-    const processed = await preprocessMemoryText({
-      content: turn.content,
-      instruction: rawArgs.copilotInstruction || DEFAULT_COPILOT_INSTRUCTION,
-      commandName: 'session-store',
-      role: turn.role,
-      model: rawArgs.copilotModel
-    });
-    processedTurns.push({ ...turn, content: processed.content });
-  }
-
-  return {
-    ...rawArgs,
-    turns: processedTurns,
-    metadata: JSON.stringify(mergeCopilotMetadata(metadata, {
-      instruction: rawArgs.copilotInstruction || DEFAULT_COPILOT_INSTRUCTION,
-      processor: process.env.MCP_MEMORY_COPILOT_CLI_COMMAND || 'gh copilot',
-      model: rawArgs.copilotModel || process.env.MCP_MEMORY_COPILOT_MODEL || DEFAULT_COPILOT_MODEL,
-      metadata: {}
-    }, { treatedTurns: processedTurns.length }))
-  };
-}
-
-async function preprocessSemanticSearchArgs(commandName, rawArgs) {
-  const rewritten = await preprocessSearchQuery({
-    query: requireString(rawArgs.query, '--query'),
-    instruction: rawArgs.copilotInstruction || DEFAULT_SEARCH_COPILOT_INSTRUCTION,
-    commandName,
-    model: rawArgs.copilotModel
-  });
-
-  return omitUndefined({
-    ...rawArgs,
-    query: rewritten.query,
-    qualityBoost: firstOf(rawArgs.qualityBoost, rewritten.qualityBoost),
-    qualityWeight: firstOf(rawArgs.qualityWeight, rewritten.qualityWeight)
-  });
-}
-
-async function preprocessTimeSearchArgs(rawArgs) {
-  const rewritten = await preprocessSearchQuery({
-    query: requireString(rawArgs.query, '--query'),
-    instruction: rawArgs.copilotInstruction || DEFAULT_SEARCH_COPILOT_INSTRUCTION,
-    commandName: 'search-by-time',
-    model: rawArgs.copilotModel
-  });
-
-  return omitUndefined({
-    ...rawArgs,
-    query: rewritten.query,
-    semanticQuery: firstOf(rawArgs.semanticQuery, rewritten.semanticQuery)
-  });
-}
-
-function mergeCopilotMetadata(metadata, processed, extra) {
-  return {
-    ...metadata,
-    copilot: omitUndefined({
-      instruction: processed.instruction,
-      processor: processed.processor,
-      model: processed.model,
-      treated_turns: extra?.treatedTurns
-    })
-  };
-}
-
-function normalizeHealthResponse(response) {
-  return omitUndefined({
-    status: response.status,
-    backend: response.backend || response.storage_type,
-    statistics: response.statistics
-  });
-}
-
-function textCommand(method, scope, path) {
-  return (client) => client.requestText({ method, scope, path });
-}
-
-function buildStoreBody(args) {
-  return omitNullish({ content: requireString(args.content, '--content'), tags: parseTags(args.tags), memory_type: args.type || args.memoryType || null, metadata: parseOptionalJson(args.metadata, '--metadata') || {}, client_hostname: firstOf(args.clientHostname, args.client_hostname), conversation_id: firstOf(args.conversationId, args.conversation_id) || null });
-}
-
-function buildListQuery(args) {
-  return omitUndefined({ page: parseOptionalInt(args.page, '--page'), page_size: parseOptionalInt(args.pageSize, '--page-size'), tag: args.tag, memory_type: args.memoryType, tag_match: args.tagMatch });
-}
-
-function buildUpdateBody(args) {
-  return omitUndefined({ tags: parseTags(args.tags), memory_type: args.memoryType || null, metadata: parseOptionalJson(args.metadata, '--metadata') });
-}
-
-function buildSessionBody(args) {
-  const tags = parseTags(args.tags);
-  return omitNullish({ turns: parseRequiredJson(args.turns, '--turns'), session_id: args.sessionId || null, tags: tags.length > 0 ? tags : undefined, metadata: parseOptionalJson(args.metadata, '--metadata') || {} });
-}
-
-function buildSemanticSearchBody(args) {
-  return omitUndefined({ query: requireString(args.query, '--query'), n_results: parseOptionalInt(firstOf(args.limit, args.nResults), '--limit') || 10, similarity_threshold: parseOptionalFloat(firstOf(args.threshold, args.similarityThreshold), '--threshold'), quality_boost: parseOptionalBoolean(args.qualityBoost), quality_weight: parseOptionalFloat(args.qualityWeight, '--quality-weight') });
-}
-
-function buildTagSearchBody(args) {
-  return { tags: requireTags(args.tags, '--tags'), match_all: parseOptionalBoolean(firstOf(args.matchAll, args.match_all)) || false, time_filter: firstOf(args.timeFilter, args.time_filter) || null };
-}
-
-function buildTimeSearchBody(args) {
-  return omitUndefined({ query: requireString(args.query, '--query'), n_results: parseOptionalInt(firstOf(args.limit, args.nResults), '--limit') || 10, semantic_query: args.semanticQuery || null });
-}
-
-function mapSearchResults(results) {
-  if (!Array.isArray(results)) {
-    return [];
-  }
-
-  return results.map((entry) => ({
-    content: entry.memory?.content || '',
-    metadata: {
-      tags: entry.memory?.tags || [],
-      type: entry.memory?.memory_type || '',
-      created_at: entry.memory?.created_at_iso || '',
-      relevance_score: entry.relevance_score ?? entry.similarity_score ?? null
-    }
-  }));
-}
-
-function buildUploadParts(args, multiple) {
-  const fileValues = multiple ? requireFileList(args.files, '--files') : [requireString(args.file, '--file')];
-  const fileField = multiple ? 'files' : 'file';
-  const parts = fileValues.map((filePath) => ({ kind: 'file', name: fileField, path: filePath }));
-  return parts.concat(buildScalarUploadParts(args));
-}
-
-function buildScalarUploadParts(args) {
-  return [
-    { name: 'tags', value: args.tags || '' },
-    { name: 'chunk_size', value: parseOptionalInt(args.chunkSize, '--chunk-size') || 1000 },
-    { name: 'chunk_overlap', value: parseOptionalInt(args.chunkOverlap, '--chunk-overlap') || 200 },
-    { name: 'memory_type', value: args.memoryType || 'document' }
-  ];
-}
-
-function parseTags(value) {
-  if (!value) {
-    return [];
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item).trim()).filter(Boolean);
-  }
-
-  return String(value).split(',').map((item) => item.trim()).filter(Boolean);
-}
-
-function requireTags(value, optionName) {
-  const tags = parseTags(value);
-  if (tags.length === 0) {
-    throw new Error(`Missing required option ${optionName}`);
-  }
-
-  return tags;
-}
-
-function requireFileList(value, optionName) {
-  const files = parseTags(value);
-  if (files.length === 0) {
-    throw new Error(`Missing required option ${optionName}`);
-  }
-
-  return files;
-}
-
-function parseOptionalJson(value, optionName) {
-  if (value === undefined || value === null || value === '') {
-    return null;
-  }
-
-  if (typeof value !== 'string') {
-    return value;
-  }
-
-  try {
-    return JSON.parse(value);
-  } catch (error) {
-    throw new Error(`Invalid JSON for ${optionName}: ${error.message}`);
-  }
-}
-
-function parseRequiredJson(value, optionName) {
-  const parsed = parseOptionalJson(value, optionName);
-  if (parsed === null) {
-    throw new Error(`Missing required option ${optionName}`);
-  }
-
-  return parsed;
-}
-
-function parseOptionalInt(value, optionName) {
-  if (value === undefined || value === null || value === '') {
-    return undefined;
-  }
-
-  const parsed = Number.parseInt(String(value), 10);
-  if (Number.isNaN(parsed)) {
-    throw new TypeError(`Invalid integer for ${optionName}`);
-  }
-
-  return parsed;
-}
-
-function requireInt(value, optionName) {
-  const parsed = parseOptionalInt(value, optionName);
-  if (parsed === undefined) {
-    throw new Error(`Missing required option ${optionName}`);
-  }
-
-  return parsed;
-}
-
-function parseOptionalFloat(value, optionName) {
-  if (value === undefined || value === null || value === '') {
-    return undefined;
-  }
-
-  const parsed = Number.parseFloat(String(value));
-  if (Number.isNaN(parsed)) {
-    throw new TypeError(`Invalid number for ${optionName}`);
-  }
-
-  return parsed;
-}
-
-function parseOptionalBoolean(value) {
-  if (value === undefined || value === null || value === '') {
-    return undefined;
-  }
-
-  if (typeof value === 'boolean') {
-    return value;
-  }
-
-  const normalized = String(value).trim().toLowerCase();
-  if (normalized === 'true') {
-    return true;
-  }
-  if (normalized === 'false') {
-    return false;
-  }
-
-  return Boolean(value);
-}
-
-function requireBoolean(value, optionName) {
-  const parsed = parseOptionalBoolean(value);
-  if (parsed === undefined) {
-    throw new Error(`Missing required option ${optionName}`);
-  }
-
-  return parsed;
-}
-
-function requireString(value, optionName) {
-  if (typeof value === 'string' && value.trim().length > 0) {
-    return value.trim();
-  }
-
-  throw new Error(`Missing required option ${optionName}`);
-}
-
-function isTurnWithContent(value) {
-  return Boolean(value) && typeof value === 'object' && typeof value.content === 'string';
-}
-
-function parseJsonRpcId(value) {
-  if (value === undefined || value === null || value === '') {
-    return null;
-  }
-
-  return String(value);
-}
-
-function firstOf(...values) {
-  return values.find((value) => value !== undefined);
-}
-
-function omitUndefined(value) {
-  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
-}
-
-function omitNullish(value) {
-  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined && entry !== null));
-}
-
-module.exports = {
-  listCommands,
-  runCommand
-};

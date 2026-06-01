@@ -3,3 +3,5 @@ coverage/
 .env
 session-state/
 .DS_Store
+scripts/
+tsconfig.tsbuildinfo

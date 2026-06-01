@@ -1,6 +1,8 @@
-const crypto = require('node:crypto');
+import { createHash, randomUUID } from 'node:crypto';
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const {
+import {
   buildNarrativeSummary,
   buildRecallReminder,
   buildSummary,
@@ -22,8 +24,8 @@ const {
   promoteSessionMemories,
   tokenize,
   unique
-} = require('./memory-cycle-domain');
-const {
+} from './memory-cycle-domain.js';
+import {
   clearActiveSessionSnapshots,
   clearLocalActiveSession,
   createRemoteClient,
@@ -34,13 +36,16 @@ const {
   saveActiveSession,
   storeSessionSummary,
   storeStructuredMemory
-} = require('./memory-cycle-http');
+} from './memory-cycle-http.js';
+import type { ActiveSession, HookPayload, RemoteClient } from './types.js';
 
-async function main() {
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+
+export async function main(): Promise<void> {
   try {
     const payload = parseJson(await readStdin());
     const eventName = getEventName(payload);
-    const client = createRemoteClient(__dirname, process.env);
+    const client = createRemoteClient(scriptDir, process.env);
 
     logDebug('hook-received', {
       eventName,
@@ -87,29 +92,29 @@ async function main() {
   }
 }
 
-async function handleSessionStart(client, payload) {
+async function handleSessionStart(client: RemoteClient, payload: HookPayload): Promise<void> {
   const runtimeSessionId = extractSessionId(payload);
   clearActiveSessionSnapshots(client, runtimeSessionId);
 
-  const session = {
-    id: runtimeSessionId || crypto.randomUUID(),
-    startedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+  const session: ActiveSession = {
+    categories: [],
+    id: runtimeSessionId || randomUUID(),
+    keywords: [],
     promptCount: 0,
     prompts: [],
-    keywords: [],
-    categories: [],
     recall: {
-      status: 'pending',
+      lastRecallAt: '',
       matchedMemoryIds: [],
-      lastRecallAt: ''
+      status: 'pending'
     },
+    startedAt: new Date().toISOString(),
+    subagents: [],
     tools: [],
-    subagents: []
+    updatedAt: new Date().toISOString(),
   };
 
-  await saveActiveSession(client, session);
-  const memories = (await listKnownMemories(client)).slice(0, 4);
+  saveActiveSession(client, session);
+  const memories = listKnownMemories(client).slice(0, 4);
   const lines = [
     'Memory cycle active for this profile.',
     'Order: recall relevant context, apply during execution, store durable outcomes, update stale entries.',
@@ -123,9 +128,9 @@ async function handleSessionStart(client, payload) {
   respond(lines.join(' '));
 }
 
-async function handleUserPromptSubmit(client, payload) {
+async function handleUserPromptSubmit(client: RemoteClient, payload: HookPayload): Promise<void> {
   const prompt = extractPrompt(payload);
-  const session = await loadActiveSession(client, extractSessionId(payload));
+  const session = loadActiveSession(client, extractSessionId(payload));
 
   if (!session || !prompt) {
     respond();
@@ -138,13 +143,13 @@ async function handleUserPromptSubmit(client, payload) {
   session.categories = unique([...session.categories, ...categorizeText(prompt)]);
   session.prompts = [...session.prompts, compressText(prompt, 220)].slice(-6);
 
-  const matches = await remoteSearch(client, prompt);
+  const matches = remoteSearch(client, prompt);
   session.recall = {
     status: matches.length > 0 ? 'matched' : 'missing',
     matchedMemoryIds: matches.map((memory) => memory.content_hash),
     lastRecallAt: new Date().toISOString()
   };
-  await saveActiveSession(client, session);
+  saveActiveSession(client, session);
 
   if (matches.length === 0) {
     respond(buildRecallReminder(session));
@@ -154,8 +159,8 @@ async function handleUserPromptSubmit(client, payload) {
   respond(`Relevant memories: ${formatMemories(matches)}. Summary format locked to MEMORY_RECORD fields for searchable persistence.`);
 }
 
-async function handlePreToolUse(client, payload) {
-  const session = await loadActiveSession(client, extractSessionId(payload));
+async function handlePreToolUse(client: RemoteClient, payload: HookPayload): Promise<void> {
+  const session = loadActiveSession(client, extractSessionId(payload));
   const tool = extractTool(payload);
   if (!session || !tool.name) {
     respond();
@@ -184,8 +189,8 @@ async function handlePreToolUse(client, payload) {
   }));
 }
 
-async function handlePostToolUse(client, payload) {
-  const session = await loadActiveSession(client, extractSessionId(payload));
+async function handlePostToolUse(client: RemoteClient, payload: HookPayload): Promise<void> {
+  const session = loadActiveSession(client, extractSessionId(payload));
   const tool = extractTool(payload);
   if (!session || !tool.name) {
     respond();
@@ -203,12 +208,12 @@ async function handlePostToolUse(client, payload) {
     }
   ].slice(-12);
   session.categories = unique([...session.categories, ...categorizeTool(tool.name, tool.target)]);
-  await saveActiveSession(client, session);
+  saveActiveSession(client, session);
   respond(`Tool recorded for memory cycle: ${tool.name}.`);
 }
 
-async function handleSubagentEvent(client, kind, payload) {
-  const session = await loadActiveSession(client, extractSessionId(payload));
+async function handleSubagentEvent(client: RemoteClient, kind: 'start' | 'stop', payload: HookPayload): Promise<void> {
+  const session = loadActiveSession(client, extractSessionId(payload));
   if (!session) {
     respond();
     return;
@@ -223,12 +228,12 @@ async function handleSubagentEvent(client, kind, payload) {
       recordedAt: session.updatedAt
     }
   ].slice(-12);
-  await saveActiveSession(client, session);
-  respond(`Subagent ${kind} recorded for memory cycle: ${session.subagents[session.subagents.length - 1].name}.`);
+  saveActiveSession(client, session);
+  respond(`Subagent ${kind} recorded for memory cycle: ${session.subagents.at(-1)?.name ?? 'unknown-subagent'}.`);
 }
 
-async function handleCheckpoint(client, payload, finalize) {
-  const session = await loadActiveSession(client, extractSessionId(payload));
+async function handleCheckpoint(client: RemoteClient, payload: HookPayload, finalize: boolean): Promise<void> {
+  const session = loadActiveSession(client, extractSessionId(payload));
   if (!session) {
     respond();
     return;
@@ -297,19 +302,19 @@ async function handleCheckpoint(client, payload, finalize) {
   }
 
   session.updatedAt = new Date().toISOString();
-  await saveActiveSession(client, session);
+  saveActiveSession(client, session);
   respond('Memory checkpoint updated before compaction.');
 }
 
-function parseJson(content) {
+function parseJson(content: string): HookPayload {
   try {
-    return JSON.parse(content || '{}');
+    return JSON.parse(content || '{}') as HookPayload;
   } catch {
     return {};
   }
 }
 
-function readStdin() {
+function readStdin(): Promise<string> {
   return new Promise((resolve) => {
     let content = '';
     process.stdin.setEncoding('utf8');
@@ -321,30 +326,26 @@ function readStdin() {
   });
 }
 
-function respond(systemMessage) {
-  const payload = { continue: true };
+function respond(systemMessage?: string): void {
+  const payload: { continue: true; systemMessage?: string } = { continue: true };
   if (systemMessage) {
     payload.systemMessage = systemMessage;
   }
   process.stdout.write(JSON.stringify(payload));
 }
 
-function hashValue(value) {
-  return crypto.createHash('sha1').update(String(value || '')).digest('hex').slice(0, 12);
+function hashValue(value: string): string {
+  return createHash('sha1').update(value).digest('hex').slice(0, 12);
 }
 
-function extractSessionId(payload) {
+function extractSessionId(payload: HookPayload): string {
   const candidates = [
-    payload?.sessionId,
-    payload?.session_id,
-    payload?.data?.sessionId,
-    payload?.data?.session_id
+    payload.sessionId,
+    payload.session_id,
+    payload.data?.sessionId,
+    payload.data?.session_id
   ];
 
-  const sessionId = candidates.find((value) => typeof value === 'string' && value.trim().length > 0);
-  return sessionId ? sessionId.trim() : '';
+  const sessionId = candidates.find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+  return sessionId?.trim() ?? '';
 }
-
-module.exports = {
-  main
-};

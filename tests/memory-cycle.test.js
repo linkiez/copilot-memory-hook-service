@@ -10,11 +10,13 @@ const sourceScript = path.resolve(__dirname, '../scripts/memory-cycle.js');
 const cliDependencies = [
   'mcp-memory-http-cli.js',
   'mcp-memory-http-client.js',
+  'mcp-memory-http-command-utils.js',
   'mcp-memory-http-commands.js',
   'mcp-memory-copilot-processor.js',
   'memory-cycle-core.js',
   'memory-cycle-domain.js',
-  'memory-cycle-http.js'
+  'memory-cycle-http.js',
+  'types.js'
 ];
 
 test('SessionStart uses the memory HTTP service and returns cycle guidance', async () => {
@@ -484,6 +486,7 @@ function createFixture() {
 
   fs.mkdirSync(scriptDir, { recursive: true });
   fs.copyFileSync(sourceScript, scriptPath);
+  fs.writeFileSync(path.join(scriptDir, 'package.json'), JSON.stringify({ type: 'module' }), 'utf8');
   for (const fileName of cliDependencies) {
     fs.copyFileSync(path.resolve(__dirname, `../scripts/${fileName}`), path.join(scriptDir, fileName));
   }

@@ -1,31 +1,42 @@
 #!/usr/bin/env node
 /* eslint-disable unicorn/prefer-top-level-await */
+import fs from 'node:fs';
+import os from 'node:os';
+import { pipeline } from 'node:stream/promises';
 
-const fs = require('node:fs');
-const os = require('node:os');
-const { pipeline } = require('node:stream/promises');
-
-const { DEFAULT_TIMEOUT_MS, MemoryHttpClient } = require('./mcp-memory-http-client');
-const { listCommands, runCommand } = require('./mcp-memory-http-commands');
+import { DEFAULT_TIMEOUT_MS, MemoryHttpClient } from './mcp-memory-http-client.js';
+import { listCommands, runCommand } from './mcp-memory-http-commands.js';
+import type { CliGlobalOptions, FallbackEnv, ParsedCli, RawCliArguments, StreamResponse } from './types.js';
 
 const DEFAULT_ENV_FILE = `${os.homedir()}/.env`;
 const HELP_TEXT = buildHelpText();
 
-function parseCli(argv) {
+/**
+ * Parses the CLI invocation into global options, a command name, and command arguments.
+ *
+ * @param argv - Raw CLI arguments excluding the Node executable and script name.
+ * @returns Parsed CLI payload.
+ */
+function parseCli(argv: string[]): ParsedCli {
   if (argv.length === 0 || argv.includes('--help')) {
-    return { showHelp: true, options: {}, command: '', arguments: {} };
+    return {
+      arguments: {},
+      command: '',
+      options: { apiKey: '', endpoint: '', insecureTls: false, timeoutMs: DEFAULT_TIMEOUT_MS },
+      showHelp: true
+    };
   }
 
-  const globalOptions = {
-    endpoint: '',
+  const globalOptions: CliGlobalOptions = {
     apiKey: '',
-    timeoutMs: DEFAULT_TIMEOUT_MS,
-    insecureTls: false
+    endpoint: '',
+    insecureTls: false,
+    timeoutMs: DEFAULT_TIMEOUT_MS
   };
   let index = 0;
 
-  while (index < argv.length && argv[index].startsWith('--')) {
-    const option = argv[index];
+  while (index < argv.length && argv[index]?.startsWith('--')) {
+    const option = argv[index] ?? '';
     if (option === '--endpoint') {
       globalOptions.endpoint = readOptionValue(argv, index, option);
       index += 2;
@@ -58,25 +69,20 @@ function parseCli(argv) {
     throw new Error('Missing command. Use --help for usage.');
   }
 
-  const commandArguments = argv.slice(index + 1);
   return {
-    showHelp: false,
-    options: globalOptions,
+    arguments: parseNamedArguments(argv.slice(index + 1)),
     command,
-    arguments: parseCommandArguments(command, commandArguments)
+    options: globalOptions,
+    showHelp: false
   };
 }
 
-function parseCommandArguments(command, argv) {
-  return parseNamedArguments(argv);
-}
-
-function parseNamedArguments(argv) {
-  const parsed = {};
+function parseNamedArguments(argv: string[]): RawCliArguments {
+  const parsed: RawCliArguments = {};
   let index = 0;
 
   while (index < argv.length) {
-    const key = argv[index];
+    const key = argv[index] ?? '';
     if (!key.startsWith('--')) {
       throw new Error(`Unexpected argument: ${key}`);
     }
@@ -96,7 +102,7 @@ function parseNamedArguments(argv) {
   return parsed;
 }
 
-function readOptionValue(argv, index, optionName) {
+function readOptionValue(argv: string[], index: number, optionName: string): string {
   const value = argv[index + 1];
   if (!value || value.startsWith('--')) {
     throw new Error(`Missing value for ${optionName}`);
@@ -105,11 +111,16 @@ function readOptionValue(argv, index, optionName) {
   return value;
 }
 
-function camelCaseKey(value) {
-  return value.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+function camelCaseKey(value: string): string {
+  return value.replace(/-([a-z])/gu, (_match, letter: string) => letter.toUpperCase());
 }
 
-async function main() {
+/**
+ * CLI entrypoint for the remote memory service bridge.
+ *
+ * @returns Process completion promise.
+ */
+export async function main(): Promise<void> {
   try {
     const cli = parseCli(process.argv.slice(2));
     if (cli.showHelp) {
@@ -117,20 +128,22 @@ async function main() {
       return;
     }
 
-    const fallbackEnv = loadFallbackEnv(process.env.MCP_MEMORY_HTTP_ENV_FILE || DEFAULT_ENV_FILE);
+    const fallbackEnv = loadFallbackEnv(process.env.MCP_MEMORY_HTTP_ENV_FILE ?? DEFAULT_ENV_FILE);
+    const resolvedApiKey = cli.options.apiKey || process.env.MCP_MEMORY_API_KEY || fallbackEnv.MCP_MEMORY_API_KEY || '';
+    const resolvedEndpoint = cli.options.endpoint || process.env.MCP_MEMORY_HTTP_ENDPOINT || fallbackEnv.MCP_MEMORY_HTTP_ENDPOINT || '';
     const client = new MemoryHttpClient({
-      endpoint: cli.options.endpoint || process.env.MCP_MEMORY_HTTP_ENDPOINT || fallbackEnv.MCP_MEMORY_HTTP_ENDPOINT,
-      apiKey: cli.options.apiKey || process.env.MCP_MEMORY_API_KEY || fallbackEnv.MCP_MEMORY_API_KEY,
-      timeoutMs: cli.options.timeoutMs,
-      insecureTls: cli.options.insecureTls
+      apiKey: resolvedApiKey,
+      endpoint: resolvedEndpoint,
+      insecureTls: cli.options.insecureTls,
+      timeoutMs: cli.options.timeoutMs
     });
 
-    if (!client.endpoint) {
+    if (client.endpoint.length === 0) {
       throw new Error('Missing memory service endpoint. Use --endpoint or MCP_MEMORY_HTTP_ENDPOINT.');
     }
 
     const result = await runCommand(client, cli.command, cli.arguments);
-    if (result?.stream) {
+    if (isStreamResponse(result)) {
       await pipeline(result.stream, process.stdout);
       return;
     }
@@ -142,12 +155,13 @@ async function main() {
 
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   } catch (error) {
-    process.stderr.write(`${error.message}\n`);
+    const message = error instanceof Error ? error.message : 'Unknown CLI error';
+    process.stderr.write(`${message}\n`);
     process.exitCode = 1;
   }
 }
 
-function buildHelpText() {
+function buildHelpText(): string {
   const commands = listCommands().join(', ');
   return `Usage:
   mcp-memory-http-cli --endpoint <url> <command> [options]
@@ -170,19 +184,20 @@ Command options for text preprocessing:
 `;
 }
 
-function loadFallbackEnv(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) {
+function loadFallbackEnv(filePath: string): FallbackEnv {
+  if (filePath.length === 0 || !fs.existsSync(filePath)) {
     return {};
   }
 
-  const output = {};
+  const output: FallbackEnv = {};
   for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/u)) {
-    const match = line.match(/^\s*(?:export\s+)?([A-Z0-9_]+)=(.*)\s*$/u);
+    const match = /^\s*(?:export\s+)?([A-Z0-9_]+)=(.*)\s*$/u.exec(line);
     if (!match) {
       continue;
     }
 
-    const [, key, rawValue] = match;
+    const key = match[1] as keyof FallbackEnv;
+    const rawValue = match[2] ?? '';
     if (key !== 'MCP_MEMORY_HTTP_ENDPOINT' && key !== 'MCP_MEMORY_API_KEY') {
       continue;
     }
@@ -193,13 +208,20 @@ function loadFallbackEnv(filePath) {
   return output;
 }
 
-function unquoteEnvValue(value) {
-  const trimmed = String(value || '').trim();
+function unquoteEnvValue(value: string): string {
+  const trimmed = value.trim();
   if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
     return trimmed.slice(1, -1);
   }
 
   return trimmed;
+}
+
+function isStreamResponse(value: unknown): value is StreamResponse {
+  return value !== null
+    && typeof value === 'object'
+    && 'stream' in value
+    && 'contentType' in value;
 }
 
 void main();

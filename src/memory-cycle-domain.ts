@@ -370,15 +370,19 @@ function buildToolNarrativeSummary(tools: ToolRecord[]): string {
     return 'none';
   }
 
-  return tools.slice(-4).map((tool) => tool.target ? `${tool.name}:${compressText(tool.target, 60)}` : tool.name).join(', ');
+  return tools
+    .slice(-4)
+    .map((tool) => tool.sensitive && tool.target ? `${tool.name}:${compressText(tool.target, 60)}` : tool.name)
+    .join(', ');
 }
 
 function buildToolTargetSummary(tools: ToolRecord[]): string {
-  if (tools.length === 0) {
+  const relevantTools = tools.filter((tool) => tool.sensitive && tool.target);
+  if (relevantTools.length === 0) {
     return 'none';
   }
 
-  return tools.slice(-4).map((tool) => tool.target ? `${tool.name}:${compressText(tool.target, 80)}` : tool.name).join(', ');
+  return relevantTools.slice(-3).map((tool) => `${tool.name}:${compressText(tool.target, 80)}`).join(', ');
 }
 
 function buildSubagentSummary(subagents: SubagentRecord[]): string {

@@ -1,36 +1,49 @@
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type { JsonObject } from './types.js';
 
 /**
  * Default instruction used when normalizing durable memory content.
  */
-export const DEFAULT_COPILOT_INSTRUCTION = 'Normalize this memory for storage. Preserve facts, remove filler, and return only JSON with a top-level content string and optional metadata object.';
+export const DEFAULT_COPILOT_INSTRUCTION = 'Curate this memory for long-term storage. Keep only durable facts, preferences, decisions, workflows, and project context. Ignore greetings, small talk, temporary test code, and transient errors. Preserve exact commands, file paths, tool names, and rationale when relevant. Return only minified JSON with a top-level content string and optional metadata object.';
 
 /**
  * Default instruction used when rewriting search queries.
  */
-export const DEFAULT_SEARCH_COPILOT_INSTRUCTION = 'Rewrite this memory search query for retrieval. Return only minified JSON with a top-level query string and optional semantic_query, quality_boost, and quality_weight fields.';
+export const DEFAULT_SEARCH_COPILOT_INSTRUCTION = 'Curate this memory search query for long-term recall. Prefer durable memories, stable decisions, project facts, workflows, and explicit user preferences over transient logs. Expand the query with precise technical terms only when that improves retrieval. Return only minified JSON with a top-level query string and optional semantic_query, quality_boost, and quality_weight fields.';
 
 /**
  * Default Copilot model used by the preprocessing bridge.
  */
 export const DEFAULT_COPILOT_MODEL = 'GPT-5 mini';
 
+/**
+ * Default timeout used for Copilot CLI preprocessing.
+ */
+export const DEFAULT_COPILOT_TIMEOUT_MS = 120_000;
+
 const MAX_BUFFER_BYTES = 1024 * 1024;
 const MEMORY_QUALITY_RULES = [
-  'Treat the memory service as long-term context: optimize output so the user does not need to repeat themselves later.',
-  'Keep memories specific, contextual, and actionable.',
-  'Preserve exact facts such as commands, file paths, technologies, workflows, decisions, and rationale when they are present.',
+  'Act as a memory curator for durable knowledge, not as a conversation logger.',
+  'Keep only one stable fact or decision per output when possible.',
+  'Save explicit user preferences, architecture decisions, project facts, and validated workflows.',
+  'Ignore greetings, small talk, temporary test code, and transient errors that do not change long-term behavior.',
+  'Preserve exact commands, file paths, technologies, tool names, and rationale when they are relevant.',
   'Prefer metadata that improves retrieval, especially tags about preferences, workflows, architecture, testing, debugging, and deployment.',
-  'Never invent facts, credentials, or missing context.'
+  'Never invent facts, credentials, duplicates, or missing context.'
 ] as const;
 const SEARCH_QUALITY_RULES = [
-  'Optimize retrieval for prior solutions, user preferences, workflows, architecture decisions, and recent debugging context.',
+  'Act as a retrieval curator for durable memories rather than a raw text matcher.',
+  'Prefer stable facts, validated workflows, architecture decisions, and explicit preferences over noisy logs.',
   'Keep the rewritten query grounded in the user wording, but expand it with precise technical terms only when that improves recall.',
   'Use semantic_query only when it adds useful retrieval context without changing the intent.',
-  'Never invent filters or entities that are not supported by the original query.'
+  'Never invent filters, entities, or memory types that are not supported by the original query.'
 ] as const;
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const CURATOR_PERSONA_INSTRUCTION = loadCuratorPersonaInstruction();
 
 interface PreprocessMemoryInput {
   commandName?: string;
@@ -52,6 +65,7 @@ interface ProcessorRunner {
   command: string;
   label: string;
   mode: 'prompt-arg' | 'stdin-json';
+  timeoutMs: number;
 }
 
 interface MemoryPromptPayload {
@@ -153,13 +167,15 @@ export async function preprocessSearchQuery(input: PreprocessSearchInput): Promi
 }
 
 function resolveRunner(): ProcessorRunner {
+  const timeoutMs = resolveTimeoutMs();
   const customCommand = process.env.MCP_MEMORY_COPILOT_CLI_COMMAND;
   if (typeof customCommand === 'string' && customCommand.trim().length > 0) {
     return {
       args: parseCommandArgs(process.env.MCP_MEMORY_COPILOT_CLI_ARGS),
       command: customCommand,
       label: customCommand,
-      mode: 'stdin-json'
+      mode: 'stdin-json',
+      timeoutMs
     };
   }
 
@@ -167,7 +183,8 @@ function resolveRunner(): ProcessorRunner {
     args: ['copilot'],
     command: 'gh',
     label: 'gh copilot',
-    mode: 'prompt-arg'
+    mode: 'prompt-arg',
+    timeoutMs
   };
 }
 
@@ -184,12 +201,24 @@ function resolveModel(value?: string): string {
   return DEFAULT_COPILOT_MODEL;
 }
 
+function resolveTimeoutMs(): number {
+  const environmentTimeout = process.env.MCP_MEMORY_COPILOT_TIMEOUT_MS;
+  if (typeof environmentTimeout === 'string' && environmentTimeout.trim().length > 0) {
+    const parsed = Number.parseInt(environmentTimeout, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  return DEFAULT_COPILOT_TIMEOUT_MS;
+}
+
 function resolveInstruction(value: string | undefined, fallbackInstruction: string, rules: readonly string[]): string {
   const baseInstruction = typeof value === 'string' && value.trim().length > 0
     ? value.trim()
     : fallbackInstruction;
 
-  return [baseInstruction, ...rules].join(' ');
+  return [baseInstruction, CURATOR_PERSONA_INSTRUCTION, ...rules].join(' ');
 }
 
 function parseCommandArgs(value: string | undefined): string[] {
@@ -216,10 +245,10 @@ async function runProcessor(
   promptBuilder: (payload: MemoryPromptPayload | SearchPromptPayload) => string
 ): Promise<string> {
   if (runner.mode === 'prompt-arg') {
-    return execFileText(runner.command, [...runner.args, '--model', payload.model, '-p', promptBuilder(payload)]);
+    return execFileText(runner.command, [...runner.args, '--model', payload.model, '-p', promptBuilder(payload)], '', runner.timeoutMs);
   }
 
-  return execFileText(runner.command, runner.args, JSON.stringify(payload));
+  return execFileText(runner.command, runner.args, JSON.stringify(payload), runner.timeoutMs);
 }
 
 function buildPrompt(payload: MemoryPromptPayload | SearchPromptPayload): string {
@@ -234,7 +263,8 @@ function buildPrompt(payload: MemoryPromptPayload | SearchPromptPayload): string
     `Instruction: ${payload.instruction}`,
     payload.role ? `Role: ${payload.role}` : '',
     `Command: ${payload.commandName}`,
-    `Content: ${payload.content}`
+    'Input JSON:',
+    JSON.stringify({ content: payload.content })
   ].filter(Boolean).join('\n');
 }
 
@@ -249,15 +279,21 @@ function buildSearchPrompt(payload: MemoryPromptPayload | SearchPromptPayload): 
     'Use this schema: {"query":"string","semantic_query":"string?","quality_boost":true|false,"quality_weight":number?}.',
     `Instruction: ${payload.instruction}`,
     `Command: ${payload.commandName}`,
-    `Query: ${payload.query}`
+    'Input JSON:',
+    JSON.stringify({ query: payload.query })
   ].join('\n');
 }
 
-function execFileText(command: string, args: string[], stdinText = ''): Promise<string> {
+function execFileText(command: string, args: string[], stdinText = '', timeoutMs = DEFAULT_COPILOT_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = execFile(command, args, { encoding: 'utf8', maxBuffer: MAX_BUFFER_BYTES }, (error, stdout, stderr) => {
+    const child = execFile(command, args, { encoding: 'utf8', maxBuffer: MAX_BUFFER_BYTES, timeout: timeoutMs }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(stderr.trim() || error.message));
+        const errorMessage = stderr.trim() || error.message;
+        const processError = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string | null };
+        const isTimeout = Boolean(processError.killed)
+          || processError.signal === 'SIGTERM'
+          || /timed out/i.test(error.message);
+        reject(new Error(isTimeout ? `Copilot CLI timed out after ${timeoutMs}ms.` : errorMessage));
         return;
       }
 
@@ -329,4 +365,24 @@ function stripCodeFence(value: string): string {
 
 function isJsonObject(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function loadCuratorPersonaInstruction(): string {
+  const filePath = path.resolve(scriptDir, '..', '.github', 'agent', 'curador.agent.md');
+  if (!fs.existsSync(filePath)) {
+    return [
+      'Curator persona: keep only durable facts, preferences, decisions, workflows, and project context.',
+      'Ignore greetings, small talk, temporary test code, and transient errors.',
+      'Update or delete obsolete memories before writing new facts.',
+      'Search first for complex tasks or old projects.'
+    ].join(' ');
+  }
+
+  return fs.readFileSync(filePath, 'utf8')
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.replace(/^(?:#+|\*+|\d+\.\s*)/u, '').trim())
+    .filter(Boolean)
+    .join(' ');
 }

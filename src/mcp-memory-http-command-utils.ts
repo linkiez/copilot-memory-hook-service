@@ -5,6 +5,8 @@ import {
   preprocessMemoryText,
   preprocessSearchQuery
 } from './mcp-memory-copilot-processor.js';
+import { attachCuratorRetrievalHints, scoreMemoryDurability } from './proactive-retrieval.js';
+import { checkForDuplicatesAutomatically, attachDuplicateCheckResult } from './automatic-duplicate-check.js';
 
 import type { HookMessage, JsonObject, MultipartPart, RawCliArguments, SearchResult } from './types.js';
 
@@ -49,19 +51,30 @@ export async function maybePreprocessArgs(commandName: string, rawArgs: RawCliAr
 }
 
 async function preprocessStoreArgs(rawArgs: RawCliArguments): Promise<RawCliArguments> {
+  const content = requireString(rawArgs.content, '--content');
   const metadata = asObject(parseOptionalJson(rawArgs.metadata, '--metadata'));
   const model = readOptionalString(rawArgs.copilotModel);
   const processed = await preprocessMemoryText({
     commandName: 'store',
-    content: requireString(rawArgs.content, '--content'),
+    content,
     instruction: readOptionalString(rawArgs.copilotInstruction) ?? DEFAULT_COPILOT_INSTRUCTION,
     ...(model === undefined ? {} : { model })
   });
 
+  // Attach proactive retrieval hints for curator decision-making
+  const enrichedMetadata = attachCuratorRetrievalHints(metadata, content);
+
+  // Run automatic duplicate check for transient memories
+  const durability = scoreMemoryDurability(content);
+  const curatorMetadata = enrichedMetadata.curator as Record<string, unknown> | undefined;
+  const proactiveQuery = (curatorMetadata?.proactiveRetrievalQuery as string) ?? '';
+  const duplicateCheckResult = await checkForDuplicatesAutomatically(proactiveQuery, durability);
+  const metadataWithDuplicateCheck = attachDuplicateCheckResult(enrichedMetadata, duplicateCheckResult);
+
   return {
     ...rawArgs,
     content: processed.content,
-    metadata: JSON.stringify(mergeCopilotMetadata(metadata, processed, null))
+    metadata: JSON.stringify(mergeCopilotMetadata(metadataWithDuplicateCheck, processed, null))
   };
 }
 

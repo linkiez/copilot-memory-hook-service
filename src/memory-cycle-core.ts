@@ -41,6 +41,16 @@ import type { ActiveSession, HookPayload, RemoteClient } from './types.js';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Updates a session collection (tools, subagents) with a new entry, maintaining history limit.
+ * @param collection - The collection to update (session.tools or session.subagents).
+ * @param entry - The new entry to add.
+ * @returns The updated collection, sliced to the last 12 entries.
+ */
+function addSessionCollectionEntry<T>(collection: T[], entry: T): T[] {
+  return [...collection, entry].slice(-12);
+}
+
 export async function main(): Promise<void> {
   try {
     const payload = parseJson(await readStdin());
@@ -198,15 +208,12 @@ async function handlePostToolUse(client: RemoteClient, payload: HookPayload): Pr
   }
 
   session.updatedAt = new Date().toISOString();
-  session.tools = [
-    ...session.tools,
-    {
-      name: tool.name,
-      target: compressText(tool.target, 80),
-      sensitive: isSensitiveTool(tool),
-      recordedAt: session.updatedAt
-    }
-  ].slice(-12);
+  session.tools = addSessionCollectionEntry(session.tools, {
+    name: tool.name,
+    target: compressText(tool.target, 80),
+    sensitive: isSensitiveTool(tool),
+    recordedAt: session.updatedAt
+  });
   session.categories = unique([...session.categories, ...categorizeTool(tool.name, tool.target)]);
   saveActiveSession(client, session);
   respond(`Tool recorded for memory cycle: ${tool.name}.`);
@@ -220,14 +227,11 @@ async function handleSubagentEvent(client: RemoteClient, kind: 'start' | 'stop',
   }
 
   session.updatedAt = new Date().toISOString();
-  session.subagents = [
-    ...session.subagents,
-    {
-      kind,
-      name: extractSubagentName(payload),
-      recordedAt: session.updatedAt
-    }
-  ].slice(-12);
+  session.subagents = addSessionCollectionEntry(session.subagents, {
+    kind,
+    name: extractSubagentName(payload),
+    recordedAt: session.updatedAt
+  });
   saveActiveSession(client, session);
   respond(`Subagent ${kind} recorded for memory cycle: ${session.subagents.at(-1)?.name ?? 'unknown-subagent'}.`);
 }

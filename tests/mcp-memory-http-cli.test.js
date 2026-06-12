@@ -96,13 +96,9 @@ test('store command posts content and metadata to the remote memory service', as
 });
 
 test('store command can preprocess content with Copilot CLI before sending', async () => {
-  const requests = [];
-  const server = await createServer((req, res, body) => {
-    requests.push({ method: req.method, url: req.url, body: JSON.parse(body) });
-    sendJson(res, 201, { success: true, message: 'stored' });
-  });
+  const { server, requests } = await createStoredMemoryServer();
 
-  const result = await runCli(server.url, [
+  const result = await runCliWithPreprocessor(server.url, [
     'store',
     '--content',
     'raw memory text',
@@ -113,27 +109,49 @@ test('store command can preprocess content with Copilot CLI before sending', asy
     'Normalize this memory',
     '--copilot-model',
     'GPT-5 mini'
-  ], {
-    MCP_MEMORY_COPILOT_CLI_COMMAND: 'node',
-    MCP_MEMORY_COPILOT_CLI_ARGS: JSON.stringify([
-      path.join(__dirname, 'fixtures-copilot-preprocessor.js')
-    ])
-  });
+  ]);
   await closeServer(server);
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].method, 'POST');
+  assertCliSuccessful(result, requests);
   assert.equal(requests[0].url, '/api/memories');
   assert.equal(requests[0].body.content, 'treated::raw memory text');
   assert.deepEqual(requests[0].body.tags, ['hook', 'workflow']);
   assert.equal(requests[0].body.metadata.copilot.processor, 'node');
   assert.equal(requests[0].body.metadata.copilot.model, 'GPT-5 mini');
   assert.match(requests[0].body.metadata.copilot.instruction, /Normalize this memory/);
-  assert.match(requests[0].body.metadata.copilot.instruction, /Keep memories specific, contextual, and actionable\./);
+  assert.match(requests[0].body.metadata.copilot.instruction, /Act as a memory curator for durable knowledge/);
+  assert.match(requests[0].body.metadata.copilot.instruction, /Ignore greetings, small talk, temporary test code, and transient errors/);
+  assert.match(requests[0].body.metadata.copilot.instruction, /Não mimetize ou salve conversas inteiras/);
 });
 
 test('store command default Copilot prompt carries memory quality guidance', async () => {
+  const { server, requests } = await createStoredMemoryServer();
+
+  const result = await runCliWithPreprocessor(server.url, [
+    'store',
+    '--content',
+    'project decision about hook architecture',
+    '--copilot-preprocess'
+  ]);
+  await closeServer(server);
+
+  assertCliSuccessful(result, requests);
+  assert.match(
+    requests[0].body.metadata.copilot.instruction,
+    /Curate this memory for long-term storage\./
+  );
+  assert.match(
+    requests[0].body.metadata.copilot.instruction,
+    /Prefer metadata that improves retrieval/
+  );
+  assert.match(
+    requests[0].body.metadata.copilot.instruction,
+    /Ignore greetings, small talk, temporary test code, and transient errors\./
+  );
+  assert.match(result.stdout, /stored/);
+});
+
+test('store command surfaces a clear error when Copilot preprocessing times out', async () => {
   const requests = [];
   const server = await createServer((req, res, body) => {
     requests.push({ method: req.method, url: req.url, body: JSON.parse(body) });
@@ -143,37 +161,26 @@ test('store command default Copilot prompt carries memory quality guidance', asy
   const result = await runCli(server.url, [
     'store',
     '--content',
-    'project decision about hook architecture',
+    'slow memory text',
     '--copilot-preprocess'
   ], {
     MCP_MEMORY_COPILOT_CLI_COMMAND: 'node',
     MCP_MEMORY_COPILOT_CLI_ARGS: JSON.stringify([
-      path.join(__dirname, 'fixtures-copilot-preprocessor.js')
-    ])
+      path.join(__dirname, 'fixtures-copilot-slow-preprocessor.js')
+    ]),
+    MCP_MEMORY_COPILOT_TIMEOUT_MS: '50'
   });
   await closeServer(server);
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(requests.length, 1);
-  assert.match(
-    requests[0].body.metadata.copilot.instruction,
-    /Keep memories specific, contextual, and actionable\./
-  );
-  assert.match(
-    requests[0].body.metadata.copilot.instruction,
-    /Prefer metadata that improves retrieval/
-  );
-  assert.match(result.stdout, /stored/);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /timed out/i);
+  assert.equal(requests.length, 0);
 });
 
 test('session-store can preprocess turn messages with Copilot CLI before sending', async () => {
-  const requests = [];
-  const server = await createServer((req, res, body) => {
-    requests.push({ method: req.method, url: req.url, body: JSON.parse(body) });
-    sendJson(res, 201, { success: true, session_id: 'session-1' });
-  });
+  const { server, requests } = await createStoredMemoryServer(201, { success: true, session_id: 'session-1' });
 
-  const result = await runCli(server.url, [
+  const result = await runCliWithPreprocessor(server.url, [
     'session-store',
     '--turns',
     '[{"role":"user","content":"primeira mensagem"},{"role":"assistant","content":"segunda mensagem"}]',
@@ -182,31 +189,22 @@ test('session-store can preprocess turn messages with Copilot CLI before sending
     'Normalize these messages',
     '--copilot-model',
     'GPT-5 mini'
-  ], {
-    MCP_MEMORY_COPILOT_CLI_COMMAND: 'node',
-    MCP_MEMORY_COPILOT_CLI_ARGS: JSON.stringify([
-      path.join(__dirname, 'fixtures-copilot-preprocessor.js')
-    ])
-  });
+  ]);
   await closeServer(server);
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(requests.length, 1);
-  assert.deepEqual(requests[0], {
-    method: 'POST',
-    url: '/api/sessions',
-    body: {
-      turns: [
-        { role: 'user', content: 'treated::primeira mensagem' },
-        { role: 'assistant', content: 'treated::segunda mensagem' }
-      ],
-      metadata: {
-        copilot: {
-          instruction: 'Normalize these messages',
-          processor: 'node',
-          model: 'GPT-5 mini',
-          treated_turns: 2
-        }
+  assertCliSuccessful(result, requests);
+  assert.equal(requests[0].url, '/api/sessions');
+  assert.deepEqual(requests[0].body, {
+    turns: [
+      { role: 'user', content: 'treated::primeira mensagem' },
+      { role: 'assistant', content: 'treated::segunda mensagem' }
+    ],
+    metadata: {
+      copilot: {
+        instruction: 'Normalize these messages',
+        processor: 'node',
+        model: 'GPT-5 mini',
+        treated_turns: 2
       }
     }
   });
@@ -488,6 +486,45 @@ test('mcp-call sends a JSON-RPC payload to the MCP endpoint', async () => {
   });
 });
 
+test('store command attaches duplicate check results to metadata for transient content', async () => {
+  const { server, requests } = await createStoredMemoryServer();
+
+  const result = await runCliWithPreprocessor(server.url, [
+    'store',
+    '--content',
+    'quick test memory',
+    '--copilot-preprocess'
+  ]);
+  await closeServer(server);
+
+  assertCliSuccessful(result, requests);
+  const metadata = requests[0].body.metadata;
+  assert.ok(metadata.duplicateCheck, 'duplicateCheck should be attached to metadata');
+  assert.equal(metadata.duplicateCheck.executedSearch, false, 'search should not execute without httpClient');
+  assert.equal(metadata.duplicateCheck.recommendation, 'proceed-store', 'should recommend storing when search is not available');
+  assert.ok(metadata.duplicateCheck.searchQuery, 'should have proactive retrieval query');
+});
+
+test('store command includes curator durability scoring in metadata', async () => {
+  const { server, requests } = await createStoredMemoryServer();
+
+  const result = await runCliWithPreprocessor(server.url, [
+    'store',
+    '--content',
+    'decision: we prefer using TypeScript for all services',
+    '--copilot-preprocess'
+  ]);
+  await closeServer(server);
+
+  assertCliSuccessful(result, requests);
+  const metadata = requests[0].body.metadata;
+  assert.ok(metadata.curator, 'curator hints should be attached');
+  assert.equal(metadata.curator.isDurable, true, 'should mark as durable when decision keyword is present');
+  assert.ok(Array.isArray(metadata.curator.durabilityReasons), 'should have durability reasons');
+  assert.ok(metadata.curator.durabilityReasons.length > 0, 'should have at least one reason');
+  assert.equal(metadata.curator.retrieverIntent, 'store-and-link', 'should recommend store-and-link for durable content');
+});
+
 function runCli(endpoint, args, env = {}) {
   return new Promise((resolve) => {
     const commandArgs = endpoint ? [cliPath, '--endpoint', endpoint, ...args] : [cliPath, ...args];
@@ -499,6 +536,44 @@ function runCli(endpoint, args, env = {}) {
       });
     });
   });
+}
+
+/**
+ * Creates a test server that tracks POST/PUT requests and stores them in a `requests` array.
+ * Useful for store, session-store, update, upload commands.
+ */
+async function createStoredMemoryServer(responseStatus, responseBody) {
+  const requests = [];
+  const status = responseStatus ?? 201;
+  const body = responseBody ?? { success: true, message: 'stored' };
+  const server = await createServer((req, res, reqBody) => {
+    requests.push({ method: req.method, url: req.url, body: JSON.parse(reqBody) });
+    sendJson(res, status, body);
+  });
+  return { server, requests };
+}
+
+/**
+ * Runs CLI with Copilot preprocessor environment pre-configured.
+ * Reduces boilerplate for preprocessing tests.
+ */
+async function runCliWithPreprocessor(serverUrl, args, preprocessorFixture = 'fixtures-copilot-preprocessor.js', extraEnv = {}) {
+  return runCli(serverUrl, args, {
+    MCP_MEMORY_COPILOT_CLI_COMMAND: 'node',
+    MCP_MEMORY_COPILOT_CLI_ARGS: JSON.stringify([
+      path.join(__dirname, preprocessorFixture)
+    ]),
+    ...extraEnv
+  });
+}
+
+/**
+ * Asserts basic CLI success and confirms exactly one request was made.
+ */
+function assertCliSuccessful(result, requests, expectedMethod = 'POST') {
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].method, expectedMethod);
 }
 
 function createEnvFile(lines) {

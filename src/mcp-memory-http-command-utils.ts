@@ -7,6 +7,15 @@ import {
 } from './mcp-memory-copilot-processor.js';
 import { attachCuratorRetrievalHints, scoreMemoryDurability } from './proactive-retrieval.js';
 import { checkForDuplicatesAutomatically, attachDuplicateCheckResult } from './automatic-duplicate-check.js';
+import {
+  buildFullCuratorRecommendation,
+  applyMemoryRefactoring
+} from './curator-decision-engine.js';
+import {
+  enhanceCuratorMetadataWithCleanup,
+  isCuratorRecommendingRejection,
+  isCuratorRecommendingRefactoring
+} from './curator-integration.js';
 
 import type { HookMessage, JsonObject, MultipartPart, RawCliArguments, SearchResult } from './types.js';
 
@@ -61,20 +70,68 @@ async function preprocessStoreArgs(rawArgs: RawCliArguments): Promise<RawCliArgu
     ...(model === undefined ? {} : { model })
   });
 
-  // Attach proactive retrieval hints for curator decision-making
-  const enrichedMetadata = attachCuratorRetrievalHints(metadata, content);
+  // Score durability for curator decision-making
+  const durability = scoreMemoryDurability(content);
+
+  // Build full curator recommendation with decision, refactoring, and cleanup plan
+  const curatorRecommendation = buildFullCuratorRecommendation(processed.content, durability);
+
+  // If curator rejects content, skip storage entirely
+  if (isCuratorRecommendingRejection(curatorRecommendation)) {
+    const enrichedMetadata = attachCuratorRetrievalHints(metadata, processed.content);
+    const finalMetadata = {
+      ...enrichedMetadata,
+      curator: {
+        ...(enrichedMetadata.curator as JsonObject | undefined),
+        decision: curatorRecommendation.decision.action,
+        reason: curatorRecommendation.decision.reason,
+        confidence: curatorRecommendation.decision.confidence,
+        nextAction: curatorRecommendation.nextAction
+      }
+    };
+    return {
+      ...rawArgs,
+      content: processed.content,
+      metadata: JSON.stringify({
+        ...finalMetadata,
+        _curatorRejected: true,
+        _rejectionReason: curatorRecommendation.decision.reason
+      })
+    };
+  }
+
+  // Apply refactoring transformations if needed
+  let refactoredContent = processed.content;
+  if (isCuratorRecommendingRefactoring(curatorRecommendation)) {
+    refactoredContent = applyMemoryRefactoring(processed.content, curatorRecommendation.memoryRefactoring);
+  }
+
+  // Attach curator hints for proactive retrieval and duplicate detection
+  const enrichedMetadata = attachCuratorRetrievalHints(metadata, refactoredContent);
 
   // Run automatic duplicate check for transient memories
-  const durability = scoreMemoryDurability(content);
   const curatorMetadata = enrichedMetadata.curator as Record<string, unknown> | undefined;
   const proactiveQuery = (curatorMetadata?.proactiveRetrievalQuery as string) ?? '';
   const duplicateCheckResult = await checkForDuplicatesAutomatically(proactiveQuery, durability);
   const metadataWithDuplicateCheck = attachDuplicateCheckResult(enrichedMetadata, duplicateCheckResult);
 
+  // Attach curator decision while preserving existing curator hints.
+  const withDecision = {
+    ...metadataWithDuplicateCheck,
+    curator: {
+      ...(metadataWithDuplicateCheck.curator as JsonObject | undefined),
+      decision: curatorRecommendation.decision.action,
+      reason: curatorRecommendation.decision.reason,
+      confidence: curatorRecommendation.decision.confidence,
+      nextAction: curatorRecommendation.nextAction
+    }
+  };
+  const finalMetadata = enhanceCuratorMetadataWithCleanup(withDecision, curatorRecommendation);
+
   return {
     ...rawArgs,
-    content: processed.content,
-    metadata: JSON.stringify(mergeCopilotMetadata(metadataWithDuplicateCheck, processed, null))
+    content: refactoredContent,
+    metadata: JSON.stringify(mergeCopilotMetadata(finalMetadata, processed, null))
   };
 }
 
